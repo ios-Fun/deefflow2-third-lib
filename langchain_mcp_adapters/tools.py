@@ -4,6 +4,8 @@ This module provides functionality to convert MCP tools into LangChain-compatibl
 tools, handle tool execution, and manage tool conversion between the two formats.
 """
 
+import logging
+import json
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any, TypedDict, get_args
 
@@ -46,7 +48,8 @@ from langchain_mcp_adapters.interceptors import (
     ToolCallInterceptor,
 )
 from langchain_mcp_adapters.sessions import Connection, create_session
-
+# from shared_global import global_mem
+logger = logging.getLogger(__name__)
 try:
     # langgraph installed
     from langgraph.types import Command
@@ -66,6 +69,28 @@ else:
 
 MAX_ITERATIONS = 1000
 
+class GlobalMemory:
+
+    # 类属性，全局唯一内存空间
+    _store = {}
+
+    @classmethod
+    def set(cls, key, value):
+        """写入全局变量"""
+        cls._store[key] = value
+
+    @classmethod
+    def get(cls, key, default=None):
+        """读取全局变量"""
+        return cls._store.get(key, default)
+
+    @classmethod
+    def clear(cls):
+        """清空全局内存"""
+        cls._store.clear()
+
+# 实例导出，所有导入者共用同一个对象
+global_mem = GlobalMemory()
 
 class MCPToolArtifact(TypedDict):
     """Artifact returned from MCP tool calls.
@@ -402,6 +427,13 @@ def convert_mcp_tool_to_langchain_tool(
 
         # Build and execute the interceptor chain
         handler = _build_interceptor_chain(execute_tool, tool_interceptors)
+        logger.info(f"Executing tool {tool.name}")
+        if tool.name.startswith("cg_"):
+            for key, value in arguments.items():
+                if key.startswith("cached_"):
+                    if global_mem.get(key) is not None:
+                        arguments[key] = global_mem.get(key)
+                        logger.info(f"Executing tool key: {key}, value: {global_mem.get(key)}")
         request = MCPToolCallRequest(
             name=tool.name,
             args=arguments,
@@ -410,6 +442,23 @@ def convert_mcp_tool_to_langchain_tool(
             runtime=runtime,
         )
         call_tool_result = await handler(request)
+        if tool.name.startswith("cg_"):
+            logger.info(f"tool.name {tool.name}")
+            text_result = call_tool_result.content[0].text
+            json_result = None
+            try:
+                json_result = json.loads(text_result)
+            except json.JSONDecodeError as e:
+                json_result = None
+            if json_result is not None:
+                call_tool_result.content[0].text = json_result["llmMsg"]
+                for key, value in json_result.items():
+                    if key.startswith("cached_"):
+                        global_mem.set(key, value)
+                        logger.info(f"shared_dict size:{len(global_mem._store)}")
+            logger.info(f"call_tool_result: {call_tool_result.content[0].text}")
+
+
 
         return _convert_call_tool_result(call_tool_result)
 
