@@ -6,8 +6,9 @@ tools, handle tool execution, and manage tool conversion between the two formats
 
 import logging
 import json
+import redis
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Any, TypedDict, get_args
+from typing import Annotated, Any, TypedDict, get_args, Optional, Dict
 
 from langchain_core.messages import ToolMessage
 from langchain_core.messages.content import (
@@ -69,6 +70,109 @@ else:
 
 MAX_ITERATIONS = 1000
 
+REDIS_CONF = {
+    "host": "192.168.0.58",
+    "port": 6379,
+    "db": 0,
+    "password": "mypassword",
+    "decode_responses": True,
+    "socket_timeout": 5
+}
+
+class _RedisClient:
+    """内部私有Redis工具，不对外暴露"""
+    def __init__(self, conf: dict):
+        self.client = redis.Redis(**conf)
+
+    def set(self, key: str, value: Any, expire: Optional[int] = None) -> bool:
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value, ensure_ascii=False)
+        return self.client.set(key, value, ex=expire)
+
+    def get(self, key: str) -> Optional[Any]:
+        raw = self.client.get(key)
+        if raw is None:
+            return None
+        # 尝试反序列化json
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # 普通字符串直接返回
+            return raw
+
+    def delete(self, *keys: str) -> int:
+        return self.client.delete(*keys)
+
+    def exists(self, key: str) -> bool:
+        return bool(self.client.exists(key))
+
+    def set_hash(self, key: str, data: Dict, expire: Optional[int] = None):
+        self.client.hset(key, mapping=data)
+        if expire:
+            self.client.expire(key, expire)
+
+    def get_hash(self, key: str) -> Dict:
+        return self.client.hgetall(key)
+
+    def get_hash_field(self, key: str, field: str):
+        return self.client.hget(key, field)
+
+    def close(self):
+        self.client.close()
+
+class GlobalMemoryRedis:
+    """全局统一缓存入口类（单例）"""
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        # 单例模式，全局只创建一次
+        if not cls._instance:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self, redis_conf: dict):
+        if not hasattr(self, "redis"):
+            # 内部持有redis实例
+            self.redis = _RedisClient(redis_conf)
+
+    # ========== 对外统一封装方法 ==========
+    def set_cache(self, key: str, value: Any, expire: Optional[int] = None) -> bool:
+        """写入字符串缓存"""
+        return self.redis.set(key, value, expire)
+
+    def get_cache(self, key: str) -> Optional[Any]:
+        """读取字符串缓存"""
+        return self.redis.get(key)
+
+    def del_cache(self, *keys: str):
+        """删除缓存key"""
+        return self.redis.delete(*keys)
+
+    def has_key(self, key: str) -> bool:
+        """判断key是否存在"""
+        return self.redis.exists(key)
+
+    def set_dict_cache(self, key: str, data: Dict, expire: Optional[int] = None):
+        """字典哈希缓存"""
+        self.redis.set_hash(key, data, expire)
+
+    def get_dict_cache(self, key: str) -> Dict:
+        """读取整个哈希字典"""
+        return self.redis.get_hash(key)
+
+    def get_dict_field(self, key: str, field: str):
+        """读取哈希单个字段"""
+        return self.redis.get_hash_field(key, field)
+
+    def close(self):
+        """关闭redis连接"""
+        self.redis.close()
+
+
+# 初始化全局单例，项目直接导入使用
+# from config import REDIS_CONF
+memoryRedis = GlobalMemoryRedis(REDIS_CONF)
+
 class GlobalMemory:
 
     # 类属性，全局唯一内存空间
@@ -90,7 +194,7 @@ class GlobalMemory:
         cls._store.clear()
 
 # 实例导出，所有导入者共用同一个对象
-global_mem = GlobalMemory()
+# global_mem = GlobalMemory()
 
 class MCPToolArtifact(TypedDict):
     """Artifact returned from MCP tool calls.
@@ -428,12 +532,33 @@ def convert_mcp_tool_to_langchain_tool(
         # Build and execute the interceptor chain
         handler = _build_interceptor_chain(execute_tool, tool_interceptors)
         logger.info(f"Executing tool {tool.name}")
-        if tool.name.startswith("cg_"):
+        thread_id = None
+        if tool.name.startswith("cg_tagTrend"):
+            key = "cached_TagsTrendPara"
+            thread_id = arguments["thread_id"]
+            redis_key = "";
+            if thread_id is not None:
+                redis_key = f"{thread_id}_{key}"
+            else:
+                redis_key = key
+            # 如果内存中有对应的key
+            if memoryRedis.has_key(redis_key):
+                value = memoryRedis.get_cache(redis_key)
+                arguments[key] = value
+                logger.info(f"Executing tool key: {redis_key}, value: {value}")
+        elif tool.name.startswith("cg_"):
+            thread_id = arguments["thread_id"]
             for key, value in arguments.items():
                 if key.startswith("cached_"):
-                    if global_mem.get(key) is not None:
-                        arguments[key] = global_mem.get(key)
-                        logger.info(f"Executing tool key: {key}, value: {global_mem.get(key)}")
+                    redis_key = "";
+                    if thread_id is not None:
+                        redis_key = f"{thread_id}_{key}"
+                    else:
+                        redis_key = key
+                    if memoryRedis.has_key(redis_key):
+                        value = memoryRedis.get_cache(redis_key)
+                        arguments[key] = value
+                        logger.info(f"Executing tool key: {redis_key}, value: {value}")
         request = MCPToolCallRequest(
             name=tool.name,
             args=arguments,
@@ -442,20 +567,33 @@ def convert_mcp_tool_to_langchain_tool(
             runtime=runtime,
         )
         call_tool_result = await handler(request)
+        logger.info(f"call_tool_result {call_tool_result}")
         if tool.name.startswith("cg_"):
             logger.info(f"tool.name {tool.name}")
+            logger.info(f"thread_id {thread_id}")
             text_result = call_tool_result.content[0].text
             json_result = None
             try:
                 json_result = json.loads(text_result)
             except json.JSONDecodeError as e:
+                logger.warn(f"json_result is None:{e}")
                 json_result = None
             if json_result is not None:
-                call_tool_result.content[0].text = json_result["llmMsg"]
+                # call_tool_result.content[0].text = json_result["llmMsg"]
+                if len(json_result) == 0:
+                    logger.warn("json_result is 0")
+
                 for key, value in json_result.items():
                     if key.startswith("cached_"):
-                        global_mem.set(key, value)
-                        logger.info(f"shared_dict size:{len(global_mem._store)}")
+                        redis_key = "";
+                        if thread_id is not None:
+                            redis_key = f"{thread_id}_{key}"
+                        else:
+                            redis_key = key
+                        memoryRedis.set_cache(redis_key, value)
+                        logger.info(f"memoryRedis set :{redis_key}")
+            else:
+                logger.warn("json_result is None")
             logger.info(f"call_tool_result: {call_tool_result.content[0].text}")
 
 
