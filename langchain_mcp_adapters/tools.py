@@ -71,7 +71,7 @@ else:
 MAX_ITERATIONS = 1000
 
 REDIS_CONF = {
-    "host": "192.168.0.58",
+    "host": "192.168.0.106",
     "port": 6379,
     "db": 0,
     "password": "mypassword",
@@ -533,32 +533,35 @@ def convert_mcp_tool_to_langchain_tool(
         handler = _build_interceptor_chain(execute_tool, tool_interceptors)
         logger.info(f"Executing tool {tool.name}")
         thread_id = None
-        if tool.name.startswith("cg_tagTrend"):
-            key = "cached_TagsTrendPara"
+        if "thread_id" in arguments:
             thread_id = arguments["thread_id"]
-            redis_key = "";
-            if thread_id is not None:
-                redis_key = f"{thread_id}_{key}"
-            else:
-                redis_key = key
-            # 如果内存中有对应的key
-            if memoryRedis.has_key(redis_key):
-                value = memoryRedis.get_cache(redis_key)
-                arguments[key] = value
-                logger.info(f"Executing tool key: {redis_key}, value: {value}")
-        elif tool.name.startswith("cg_"):
-            thread_id = arguments["thread_id"]
-            for key, value in arguments.items():
-                if key.startswith("cached_"):
-                    redis_key = "";
-                    if thread_id is not None:
-                        redis_key = f"{thread_id}_{key}"
-                    else:
-                        redis_key = key
-                    if memoryRedis.has_key(redis_key):
-                        value = memoryRedis.get_cache(redis_key)
-                        arguments[key] = value
-                        logger.info(f"Executing tool key: {redis_key}, value: {value}")
+        # thread_id = None
+        # if tool.name.startswith("cg_tagTrend"):
+        #     key = "cached_TagsTrendPara"
+        #     thread_id = arguments["thread_id"]
+        #     redis_key = "";
+        #     if thread_id is not None:
+        #         redis_key = f"{thread_id}_{key}"
+        #     else:
+        #         redis_key = key
+        #     # 如果内存中有对应的key
+        #     if memoryRedis.has_key(redis_key):
+        #         value = memoryRedis.get_cache(redis_key)
+        #         arguments[key] = value
+        #         logger.info(f"Executing tool key: {redis_key}, value: {value}")
+        # elif tool.name.startswith("cg_"):
+        #     thread_id = arguments["thread_id"]
+        #     for key, value in arguments.items():
+        #         if key.startswith("cached_"):
+        #             redis_key = "";
+        #             if thread_id is not None:
+        #                 redis_key = f"{thread_id}_{key}"
+        #             else:
+        #                 redis_key = key
+        #             if memoryRedis.has_key(redis_key):
+        #                 value = memoryRedis.get_cache(redis_key)
+        #                 arguments[key] = value
+        #                 logger.info(f"Executing tool key: {redis_key}, value: {value}")
         request = MCPToolCallRequest(
             name=tool.name,
             args=arguments,
@@ -568,7 +571,8 @@ def convert_mcp_tool_to_langchain_tool(
         )
         call_tool_result = await handler(request)
         logger.info(f"call_tool_result {call_tool_result}")
-        if tool.name.startswith("cg_"):
+        # if tool.name.startswith("cg_") and thread_id is not None:
+        if thread_id is not None:
             logger.info(f"tool.name {tool.name}")
             logger.info(f"thread_id {thread_id}")
             text_result = call_tool_result.content[0].text
@@ -579,7 +583,8 @@ def convert_mcp_tool_to_langchain_tool(
                 logger.warn(f"json_result is None:{e}")
                 json_result = None
             if json_result is not None:
-                # call_tool_result.content[0].text = json_result["llmMsg"]
+                if "llmMsg" in json_result:
+                    call_tool_result.content[0].text = json_result["llmMsg"]
                 if len(json_result) == 0:
                     logger.warn("json_result is 0")
 
@@ -591,7 +596,15 @@ def convert_mcp_tool_to_langchain_tool(
                         else:
                             redis_key = key
                         memoryRedis.set_cache(redis_key, value)
-                        logger.info(f"memoryRedis set :{redis_key}")
+                        logger.info(f"memoryRedis cache set :{redis_key}")
+                    if key.startswith("result_"):
+                        redis_key = "";
+                        if thread_id is not None:
+                            redis_key = f"{thread_id}_{key}"
+                        else:
+                            redis_key = key
+                        memoryRedis.set_cache(redis_key, value)
+                        logger.info(f"memoryRedis result set :{redis_key}")
             else:
                 logger.warn("json_result is None")
             logger.info(f"call_tool_result: {call_tool_result.content[0].text}")
