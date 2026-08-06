@@ -42,6 +42,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
+logger = logging.getLogger(__name__)
 from collections.abc import Awaitable, Callable
 from copy import copy, deepcopy
 from dataclasses import dataclass, field, replace
@@ -119,6 +121,79 @@ TOOL_INVOCATION_ERROR_TEMPLATE = (
     " {error}\n"
     " Please fix the error and try again."
 )
+
+import csv
+import ahocorasick
+
+class LazyCsvListLoader:
+    def __init__(self):
+        self.csv_path = "device.csv"
+        self._data_list: list | None = None
+
+    @property
+    def data_list(self) -> list[dict]:
+        if self._data_list is None:
+            self._data_list = self._load_csv()
+        return self._data_list
+
+    def _load_csv(self) -> list[dict]:
+        result = []
+        with open(self.csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                result.append(row[0].strip())
+        return result
+
+    def clear_cache(self):
+        self._data_list = None
+
+
+class AhoKeywordMatcher:
+    def __init__(self):
+        """
+        :param file_path: csv/excel路径
+        :param keyword_col: 文件中存储关键词的列名
+        """
+        self._loader = LazyCsvListLoader()
+        self._automaton: ahocorasick.Automaton | None = None
+
+    def _build_automaton(self) -> ahocorasick.Automaton:
+        """懒构建ac自动机，只构建一次"""
+        automaton = ahocorasick.Automaton()
+        rows = self._loader.data_list  # 这里触发懒加载读文件，只读一次
+
+        for idx, key in enumerate(rows):
+            # key:关键词，value:原始行数据；你也可以只存关键词
+            automaton.add_word(key, (idx, key))
+
+        automaton.make_automaton()
+        return automaton
+
+    @property
+    def automaton(self) -> ahocorasick.Automaton:
+        if self._automaton is None:
+            self._automaton = self._build_automaton()
+        return self._automaton
+
+    def find_all(self, text: str):
+        """查找文本中所有命中的关键词，返回list[(end_pos, keyword, row_dict)]"""
+        results = []
+        for end_idx, (kw, row) in self.automaton.iter(text):
+            results.append((end_idx, kw, row))
+        return results
+
+    def has_any_match(self, text: str) -> bool:
+        """判断字符串是否包含csv中任意关键词（只要命中一个立刻返回True，性能高）"""
+        try:
+            next(self.automaton.iter(text))
+            return True
+        except StopIteration:
+            return False
+
+    def clear_all_cache(self):
+        """清空文件缓存 + 销毁自动机；下次调用会重读文件、重建ac树"""
+        self._loader.clear_cache()
+        self._automaton = None
 
 
 class _ToolCallRequestOverrides(TypedDict, total=False):
@@ -938,9 +1013,17 @@ class ToolNode(RunnableCallable):
         Raises:
             Exception: If tool fails and handle_tool_errors is False.
         """
+        logger.info("_execute_tool_sync")
         call = request.tool_call
         tool = request.tool
-        # logger.info(f"Execute tool sync: {call['name']}, para: {call["args"]}")
+        try:
+            if call['args'] is not None:
+                logger.info(f"Execute tool sync: {call['name']}, para: {call['args']}")
+
+            else:
+                logger.info(f"Execute tool sync: {call['name']}")
+        except Exception as e:
+            logger.info(f"Execute tool sync: {e}")
         # Validate tool exists when we actually need to execute it
         if tool is None:
             if invalid_tool_message := self._validate_tool_call(call):
@@ -1087,7 +1170,43 @@ class ToolNode(RunnableCallable):
         """
         call = request.tool_call
         tool = request.tool
-        # logger.info(f"Execute tool sync: {call['name']}, para: {call["args"]}")
+        try:
+            if call['args'] is not None:
+                logger.info(f"Execute tool sync: {call['name']}, para: {call['args']}")
+                if call['name'] == "read_file":
+                    path = call['args']["path"]
+                    if "title" in request.runtime.state:
+                        title = request.runtime.state["title"]
+                        if path.endswith("device-healthy/SKILL.md") or path.endswith("unit-healthy/SKILL.md"):
+                            # 表示为机组健康和设备健康
+                            logger.info("is healthy")
+                            matcher = AhoKeywordMatcher()
+                            if title is not None:
+                                try:
+                                    hit = matcher.has_any_match(title)
+                                    logger.info(f"是否命中：{hit}")
+                                    if hit:
+                                        # 表示为设备
+                                        if path.endswith("unit-healthy/SKILL.md"):
+                                            # 替换
+                                            path = path.replace("unit-healthy", "device-healthy", 1)
+                                            call['args']["path"] = path
+                                            logger.info(f"replace：{path}")
+                                    else:
+                                        # 表示为机组
+                                        if path.endswith("device-healthy/SKILL.md"):
+                                            # 替换
+                                            path = path.replace("device-healthy", "unit-healthy", 1)
+                                            call['args']["path"] = path
+                                            logger.info(f"replace：{path}")
+
+                                except Exception as e:
+                                    logger.info(f"is healthy error：{e}")
+                    logger.info(f"Execute tool sync replace: {call['name']}, para: {call['args']}")
+            else:
+                logger.info(f"Execute tool sync: {call['name']}")
+        except Exception as e:
+            logger.info(f"Execute tool sync error: {e}")
         # Validate tool exists when we actually need to execute it
         if tool is None:
             if invalid_tool_message := self._validate_tool_call(call):
@@ -1176,6 +1295,7 @@ class ToolNode(RunnableCallable):
         """
         # Validation is deferred to _execute_tool_async to allow interceptors
         # to short-circuit requests for unregistered tools
+        logger.info("_arun_one")
         tool = self.tools_by_name.get(call["name"])
 
         # Create the tool request with state and runtime
@@ -1191,6 +1311,8 @@ class ToolNode(RunnableCallable):
         if self._awrap_tool_call is None and self._wrap_tool_call is None:
             # No wrapper - execute directly
             return await self._execute_tool_async(tool_request, input_type, config)
+        else:
+            logger.info(f"{tool} is none 1")
 
         # Define async execute callable that can be called multiple times
         async def execute(req: ToolCallRequest) -> ToolMessage | Command:
@@ -1205,6 +1327,8 @@ class ToolNode(RunnableCallable):
         try:
             if self._awrap_tool_call is not None:
                 return await self._awrap_tool_call(tool_request, execute)
+            else:
+                logger.info(f"{tool} is none 2")
             # None check was performed above already
             self._wrap_tool_call = cast("ToolCallWrapper", self._wrap_tool_call)
             return self._wrap_tool_call(tool_request, _sync_execute)
